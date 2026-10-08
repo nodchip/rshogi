@@ -73,6 +73,9 @@ use tools::selfplay::{
 };
 use tools::sprt::{Decision, GameSide, Penta, SprtMetaLog, SprtParameters, judge};
 
+#[path = "tournament/progress.rs"]
+mod progress;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -149,6 +152,16 @@ struct Cli {
     /// 出力ディレクトリ。既存の対局出力がある場合は拒否する。
     #[arg(long)]
     out_dir: PathBuf,
+
+    /// 実結果イベントから更新するUTF-8進捗表示の絶対パス。結果検査の代替ではない。
+    #[arg(long, requires_all = ["progress_experiment_id", "progress_run_id"])]
+    progress_file: Option<PathBuf>,
+    /// 呼出し側が固定した実験UUID。表示用で、実processの識別ではない。
+    #[arg(long, value_parser = progress::parse_id, requires_all = ["progress_file", "progress_run_id"])]
+    progress_experiment_id: Option<String>,
+    /// 呼出し側が固定した実行UUID。
+    #[arg(long, value_parser = progress::parse_id, requires_all = ["progress_file", "progress_experiment_id"])]
+    progress_run_id: Option<String>,
 
     /// Start position file (USI position lines, one per line)
     #[arg(long)]
@@ -374,6 +387,57 @@ struct TournamentMeta {
     incomplete_pairs: u32,
     /// 送信済みだが worker から結果を回収できなかったチケット数。
     unreturned_games: u32,
+    /// 所有したengine processの終了観測。running時は未確定。
+    engine_exits: EngineExitSummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct EngineExitSummary {
+    observations_complete: bool,
+    spawned: u32,
+    reaped: u32,
+    forced: u32,
+    non_success: u32,
+    /// 起動失敗・panic・wait失敗で終了観測を確定できなかった件数。
+    unconfirmed: u32,
+}
+
+impl EngineExitSummary {
+    fn merge(&mut self, other: Self) {
+        self.spawned += other.spawned;
+        self.reaped += other.reaped;
+        self.forced += other.forced;
+        self.non_success += other.non_success;
+        self.unconfirmed += other.unconfirmed;
+    }
+
+    fn normal_exits_confirmed(&self) -> bool {
+        self.observations_complete
+            && self.spawned == self.reaped
+            && self.forced == 0
+            && self.non_success == 0
+            && self.unconfirmed == 0
+    }
+}
+
+fn reap_engines(engines: &mut [EngineProcess], unconfirmed: u32) -> EngineExitSummary {
+    let mut summary = EngineExitSummary {
+        observations_complete: true,
+        spawned: engines.len() as u32,
+        unconfirmed,
+        ..EngineExitSummary::default()
+    };
+    for engine in engines {
+        match engine.shutdown() {
+            Ok(report) => {
+                summary.reaped += 1;
+                summary.forced += u32::from(report.forced);
+                summary.non_success += u32::from(!report.success);
+            }
+            Err(_) => summary.unconfirmed += 1,
+        }
+    }
+    summary
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -705,7 +769,7 @@ fn worker_main(
     tx: chan::Sender<MatchResult>,
     shutdown: Arc<AtomicBool>,
     worker_failed: Arc<AtomicBool>,
-) {
+) -> EngineExitSummary {
     let WorkerConfig {
         engine_paths,
         engine_labels,
@@ -747,7 +811,7 @@ fn worker_main(
                 eprintln!("worker: failed to spawn engine {i} ({}): {e}", path.display());
                 worker_failed.store(true, Ordering::Relaxed);
                 shutdown.store(true, Ordering::Relaxed);
-                return;
+                return reap_engines(&mut engines, 1);
             }
         }
     }
@@ -779,7 +843,7 @@ fn worker_main(
                 error: true,
                 worker_retired: true,
             });
-            return;
+            return reap_engines(&mut engines, 0);
         }
 
         let start_pos = &start_positions[ticket.startpos_idx];
@@ -846,7 +910,7 @@ fn worker_main(
                     error: true,
                     worker_retired: true,
                 });
-                return;
+                return reap_engines(&mut engines, 0);
             }
             Err(_) => {
                 eprintln!("worker: game {game_id} panicked; retiring worker");
@@ -859,10 +923,11 @@ fn worker_main(
                     error: true,
                     worker_retired: true,
                 });
-                return;
+                return reap_engines(&mut engines, 0);
             }
         }
     }
+    reap_engines(&mut engines, 0)
 }
 
 /// ワーカー spawn に必要な不変設定への参照束。チャネル送受信は保持しない。
@@ -895,7 +960,7 @@ fn spawn_worker(
     result_tx: &chan::Sender<MatchResult>,
     shutdown: &Arc<AtomicBool>,
     worker_failed: &Arc<AtomicBool>,
-    handles: &mut Vec<thread::JoinHandle<()>>,
+    handles: &mut Vec<thread::JoinHandle<EngineExitSummary>>,
 ) {
     let cfg = WorkerConfig {
         engine_paths: ctx.engine_paths.to_vec(),
@@ -929,13 +994,18 @@ fn spawn_worker(
     let failed = worker_failed.clone();
     handles.push(thread::spawn(move || {
         // panic で結果送信元だけが消えても、main が channel 待ちを続けないよう通知する。
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_main(cfg, rx, tx, sd.clone(), failed.clone());
-        }))
-        .is_err()
-        {
-            failed.store(true, Ordering::Relaxed);
-            sd.store(true, Ordering::Relaxed);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_main(cfg, rx, tx, sd.clone(), failed.clone())
+        })) {
+            Ok(summary) => summary,
+            Err(_) => {
+                failed.store(true, Ordering::Relaxed);
+                sd.store(true, Ordering::Relaxed);
+                EngineExitSummary {
+                    unconfirmed: 1,
+                    ..EngineExitSummary::default()
+                }
+            }
         }
     }));
 }
@@ -981,6 +1051,20 @@ fn reserve_output_directory(path: &Path) -> Result<File> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let progress_display =
+        match (&cli.progress_file, &cli.progress_experiment_id, &cli.progress_run_id) {
+            (None, None, None) => None,
+            (Some(path), Some(experiment_id), Some(run_id)) => {
+                let display =
+                    progress::Display::new(path.clone(), experiment_id.clone(), run_id.clone())?;
+                display.validate_paths(
+                    &cli.out_dir,
+                    cli.engines.iter().map(PathBuf::as_path).chain(cli.startpos_file.as_deref()),
+                )?;
+                Some(display)
+            }
+            _ => bail!("progress options must be supplied together"),
+        };
     let seed = cli.seed.unwrap_or_else(|| rand::rng().random());
     eprintln!("startpos seed: {seed}");
 
@@ -1210,11 +1294,14 @@ fn main() -> Result<()> {
         run_status: RunStatus::Running,
         incomplete_pairs: 0,
         unreturned_games: 0,
+        engine_exits: EngineExitSummary::default(),
     };
     // meta.json 書き出し
     {
         let meta_file = File::create_new(cli.out_dir.join("meta.json"))?;
-        serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
+        let mut writer = BufWriter::new(meta_file);
+        serde_json::to_writer_pretty(&mut writer, &tournament_meta)?;
+        writer.flush()?;
     }
 
     // SPRT 有効化時のラベル解決（ticket 生成前に検証しておきたい）
@@ -1421,7 +1508,9 @@ fn main() -> Result<()> {
         // 0 だと進捗が一切出ないため最低 1 に丸める。
         report_interval: cli.report_interval.max(1),
         start_time,
+        progress_display,
     };
+    agg.update_display(source.current_target_total(), false, true);
 
     // 制御プレーンの状態。
     let control_path = cli.out_dir.join("control.json");
@@ -1573,10 +1662,16 @@ fn main() -> Result<()> {
         agg.on_result(&result, tickets_sent, source.current_target_total())?;
         source.observe_result(&result);
     }
+    let mut engine_exits = EngineExitSummary::default();
     for h in handles {
-        if h.join().is_err() {
-            worker_failed.store(true, Ordering::Relaxed);
+        match h.join() {
+            Ok(summary) => engine_exits.merge(summary),
+            Err(_) => engine_exits.unconfirmed += 1,
         }
+    }
+    engine_exits.observations_complete = true;
+    if !engine_exits.normal_exits_confirmed() {
+        worker_failed.store(true, Ordering::Relaxed);
     }
     let run_status = if worker_failed.load(Ordering::Relaxed) {
         RunStatus::WorkerFailed
@@ -1593,6 +1688,7 @@ fn main() -> Result<()> {
         sprt_state,
         completed,
         valid_completed,
+        mut progress_display,
         ..
     } = agg;
 
@@ -1617,6 +1713,7 @@ fn main() -> Result<()> {
     retry_summary.invalid |= run_status != RunStatus::Completed;
     tournament_meta.retry = retry_summary;
     tournament_meta.run_status = run_status;
+    tournament_meta.engine_exits = engine_exits;
     tournament_meta.incomplete_pairs = source
         .emitted
         .iter()
@@ -1625,7 +1722,22 @@ fn main() -> Result<()> {
         .saturating_sub(valid_completed / 2);
     tournament_meta.unreturned_games = tickets_sent.saturating_sub(completed);
     let meta_file = File::create(cli.out_dir.join("meta.json"))?;
-    serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
+    let mut writer = BufWriter::new(meta_file);
+    serde_json::to_writer_pretty(&mut writer, &tournament_meta)?;
+    writer.flush()?;
+    if let Some(display) = &mut progress_display {
+        display.update(
+            progress::Snapshot {
+                received_games: completed,
+                valid_games: valid_completed,
+                target_valid_games: source.current_target_total(),
+                elapsed: start_time.elapsed(),
+                collection_finished: true,
+                pair_stats: &pair_stats,
+            },
+            true,
+        );
+    }
 
     println!();
     println!(
@@ -2064,6 +2176,7 @@ struct Aggregator<'a> {
     stop_feeding: bool,
     report_interval: u32,
     start_time: Instant,
+    progress_display: Option<progress::Display>,
 }
 
 #[derive(Clone, Copy)]
@@ -2075,6 +2188,21 @@ struct DirectResult {
 }
 
 impl Aggregator<'_> {
+    fn update_display(&mut self, target: u32, collection_finished: bool, force: bool) {
+        if let Some(display) = &mut self.progress_display {
+            display.update(
+                progress::Snapshot {
+                    received_games: self.completed,
+                    valid_games: self.valid_completed,
+                    target_valid_games: target,
+                    elapsed: self.start_time.elapsed(),
+                    collection_finished,
+                    pair_stats: &self.pair_stats,
+                },
+                force,
+            );
+        }
+    }
     /// 1 件の対局結果を取り込む。集計・JSONL 出力・SPRT 観測・進捗表示まで行う。
     fn on_result(
         &mut self,
@@ -2092,6 +2220,7 @@ impl Aggregator<'_> {
             self.valid_completed += 2;
         }
         self.completed += 1;
+        self.update_display(target_total, false, false);
         handle_sprt_observation(
             &mut self.sprt_state,
             result,
@@ -2426,6 +2555,86 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn progress_arguments_are_optional_but_require_all_identities() {
+        let base = [
+            "tournament",
+            "--engine",
+            "a",
+            "--engine",
+            "b",
+            "--out-dir",
+            "out",
+        ];
+        assert!(super::Cli::try_parse_from(base).is_ok());
+        for missing in 0..3 {
+            let mut args = base.to_vec();
+            for (index, (flag, value)) in [
+                ("--progress-file", "progress.txt"),
+                ("--progress-experiment-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                ("--progress-run-id", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(super::Cli::try_parse_from(args).is_err());
+        }
+        let mut args = base.to_vec();
+        args.extend([
+            "--progress-file",
+            "progress.txt",
+            "--progress-experiment-id",
+            "not-an-id",
+            "--progress-run-id",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ]);
+        assert!(super::Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn engine_exit_summary_requires_complete_normal_observations() {
+        use super::EngineExitSummary;
+        assert!(!EngineExitSummary::default().normal_exits_confirmed());
+        let normal = EngineExitSummary {
+            observations_complete: true,
+            spawned: 2,
+            reaped: 2,
+            ..EngineExitSummary::default()
+        };
+        assert!(normal.normal_exits_confirmed());
+        for incomplete in [
+            EngineExitSummary {
+                reaped: 1,
+                ..normal
+            },
+            EngineExitSummary {
+                forced: 1,
+                ..normal
+            },
+            EngineExitSummary {
+                non_success: 1,
+                ..normal
+            },
+            EngineExitSummary {
+                unconfirmed: 1,
+                ..normal
+            },
+        ] {
+            assert!(!incomplete.normal_exits_confirmed());
+        }
+        let mut joined = EngineExitSummary::default();
+        joined.merge(normal);
+        joined.merge(normal);
+        assert_eq!((joined.spawned, joined.reaped), (4, 4));
+        assert!(!joined.normal_exits_confirmed(), "mergeだけでは全worker joinを確定しない");
+        joined.observations_complete = true;
+        assert!(joined.normal_exits_confirmed());
+    }
+
+    #[test]
     fn sprt_nelo_bounds_accept_space_separated_negative_values() {
         for (nelo0, nelo1, expected0, expected1) in [
             ("-10", "0", -10.0, 0.0),
@@ -2703,7 +2912,9 @@ mod tests {
         }
         assert!(shutdown.load(Ordering::Relaxed));
         assert!(failed.load(Ordering::Relaxed));
-        handles.pop().unwrap().join().unwrap();
+        let exits = handles.pop().unwrap().join().unwrap();
+        assert!(!exits.normal_exits_confirmed());
+        assert_eq!(exits.unconfirmed, 1);
     }
 
     #[test]
@@ -2771,6 +2982,7 @@ mod tests {
             stop_feeding: false,
             report_interval: 10,
             start_time: std::time::Instant::now(),
+            progress_display: None,
         };
         let mut sprt = SprtState::new(
             super::SprtParameters::new(0.0, 5.0, 0.05, 0.05).unwrap(),

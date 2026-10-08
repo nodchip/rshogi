@@ -3,6 +3,39 @@
 複数エンジン間の総当たり (round-robin) 対局、base-vs-N 対局、または SPRT（逐次確率比検定）を並列実行するツール。
 対局ログは analyze_selfplay 互換の JSONL 形式で出力される。
 
+## engine終了の観測
+
+`meta.json`の`engine_exits`は、workerが所有したengine processのOS終了観測を集約する。
+`observations_complete`は全workerのjoin後にだけtrueになり、`spawned`は所有した数、
+`reaped`は終了をOSから回収した数を表す。`forced`はquit後の既存の短い待機を超えて
+killを試みた数、`non_success`は成功でない終了statusの数、`unconfirmed`は起動失敗・
+panic・wait失敗などで終了観測を確定できなかった件数である。起動失敗が実際の子生成前に
+起きた場合も、子が残っていないと推測せず`unconfirmed`へ含める。
+
+`observations_complete=true`、`spawned=reaped`、`forced=non_success=unconfirmed=0`
+でなければ正常な終了確認とせず、`run_status=worker_failed`と`invalid=true`を保存する。
+回収済みのprocessにquit/killを重ねない。エンジンが生成する孫processや、親の強制終了後の
+自動回収を保証するものではない。欄のない古いmetaやrunning中のmetaは終了証拠にしない。
+
+## 任意の進捗テキスト出力
+
+`--progress-file /path/to/progress.txt --progress-experiment-id <UUID> --progress-run-id <UUID>`
+を指定すると、集計側だけがUTF-8の進捗ファイルを更新する。3引数はすべて指定する。
+表示先は絶対パスで、対局出力ディレクトリの外に置き、engineや開始局面ファイルとの
+同一パス・aliasはengine起動前に拒否する。親ディレクトリは事前に用意する。
+
+更新は実結果の取込み時に通常10秒で間引く。開始・結果保存後には値を書き、
+専用timerやheartbeatは持たない。`received_games`は受信数、`valid_games`は有効な
+先後反転ペアがそろった局数、`target_valid_games`は現在の目標局数を表す。
+`pair_i_j`はmetaのengine index i側から見た、jとの対局の勝・分・敗である。
+ラベル・engine設定・入力パスなどは表示に含めない。
+
+同じディレクトリへ完全な一時ファイルを書いてから置換する。表示の書込みに失敗したら
+古い表示を維持し、固定warningを実行ID付きで1回だけ出す。
+以後の実イベントで通常10秒の間引きを守って再試行し、独立した再試行loopは持たない。
+対局・集計は継続する。最終表示の`result_unchecked`は成功判定ではない。
+古い表示や欠落を成功/終了の証拠にせず、processの終了、meta、対局ログを別途検査する。
+
 ## USI評価の進捗値と同一行の主PV記録
 
 move行の `eval.depth` / `score_cp` / `pv` などは、従来どおり存在するfieldだけを

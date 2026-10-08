@@ -66,6 +66,17 @@ pub struct EngineConfig {
     pub usi_options: Vec<String>,
 }
 
+/// OSから回収した、所有する子engineの終了観測。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineExitReport {
+    /// signal終了ではNoneになることがある。
+    pub exit_code: Option<i32>,
+    /// OSのExitStatusが成功を表すか。
+    pub success: bool,
+    /// quit後の既存の待機期限を超え、killを試みたか。
+    pub forced: bool,
+}
+
 /// 1本のエンジンに対する入出力をカプセル化する。
 pub struct EngineProcess {
     child: Child,
@@ -74,6 +85,7 @@ pub struct EngineProcess {
     recent_stderr: Arc<Mutex<VecDeque<String>>>,
     opt_names: HashSet<String>,
     read_timeout_hint_printed: Cell<bool>,
+    exit_report: Option<EngineExitReport>,
     pub label: String,
 }
 
@@ -210,6 +222,7 @@ impl EngineProcess {
             recent_stderr,
             opt_names: HashSet::new(),
             read_timeout_hint_printed: Cell::new(false),
+            exit_report: None,
             label,
         })
     }
@@ -681,20 +694,42 @@ impl EngineProcess {
         self.stdin.flush()?;
         Ok(())
     }
-}
 
-impl Drop for EngineProcess {
-    fn drop(&mut self) {
+    /// quitと既存の短い待機・kill/waitで、この所有する子processのOS終了を回収する。
+    /// 孫processの終了保証ではない。回収済みなら同じ観測値を返し、再送・再killしない。
+    pub fn shutdown(&mut self) -> std::io::Result<EngineExitReport> {
+        if let Some(report) = self.exit_report {
+            return Ok(report);
+        }
         let _ = self.write_line("quit");
         let deadline = Instant::now() + ENGINE_QUIT_TIMEOUT;
         while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
+            if let Ok(Some(status)) = self.child.try_wait() {
+                let report = EngineExitReport {
+                    exit_code: status.code(),
+                    success: status.success(),
+                    forced: false,
+                };
+                self.exit_report = Some(report);
+                return Ok(report);
             }
             std::thread::sleep(ENGINE_QUIT_POLL_INTERVAL);
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait()?;
+        let report = EngineExitReport {
+            exit_code: status.code(),
+            success: status.success(),
+            forced: true,
+        };
+        self.exit_report = Some(report);
+        Ok(report)
+    }
+}
+
+impl Drop for EngineProcess {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -766,6 +801,73 @@ mod stderr_tests {
         assert_eq!(read_stderr_line(&mut reader).unwrap().unwrap().len(), 4096);
         assert_eq!(read_stderr_line(&mut reader).unwrap().unwrap(), "next");
         assert_eq!(read_stderr_line(&mut reader).unwrap(), None);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod exit_observation_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_observes_normal_nonzero_and_forced_exit_without_repeating_quit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/exit-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let script = dir.path().join("engine.ps1");
+        let log = dir.path().join("quit-count.txt");
+        std::fs::write(
+            &script,
+            r#"
+param([string]$mode, [string]$log)
+while ($null -ne ($line = [Console]::ReadLine())) {
+    switch ($line) {
+        'usi' { [Console]::WriteLine('usiok') }
+        'isready' { [Console]::WriteLine('readyok') }
+        'quit' {
+            [IO.File]::AppendAllText($log, 'quit' + [Environment]::NewLine)
+            if ($mode -eq 'normal') { exit 0 }
+            if ($mode -eq 'nonzero') { exit 7 }
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        for mode in ["normal", "nonzero", "ignore"] {
+            let cfg = EngineConfig {
+                path: PathBuf::from("powershell.exe"),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-File".into(),
+                    script.display().to_string(),
+                    mode.into(),
+                    log.display().to_string(),
+                ],
+                threads: 1,
+                hash_mb: 1,
+                network_delay: None,
+                network_delay2: None,
+                minimum_thinking_time: None,
+                slowmover: None,
+                ponder: false,
+                usi_options: vec![],
+            };
+            let mut engine =
+                EngineProcess::spawn_with_timeout(&cfg, "fixture".into(), Duration::from_secs(10))
+                    .unwrap();
+            let report = engine.shutdown().unwrap();
+            assert!(engine.child.try_wait().unwrap().is_some());
+            assert_eq!(report.forced, mode == "ignore");
+            assert_eq!(report.success, mode == "normal");
+            if mode == "nonzero" {
+                assert_eq!(report.exit_code, Some(7));
+            }
+            let recorded = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(report, engine.shutdown().unwrap());
+            drop(engine);
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), recorded);
+        }
     }
 }
 

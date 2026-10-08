@@ -6,6 +6,8 @@ crates/tools/src/bin/ 配下の主要バイナリの一覧と解説。
 
 ## 対局・トーナメント
 
+`tournament`の通常engine終了観測は[`meta.json`のengine_exits](tournament.md#engine終了の観測)、任意の表示ファイルは[進捗テキスト出力](tournament.md#任意の進捗テキスト出力)を参照。
+
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 既存対局出力を保護し、カード index と表示ラベルを含むファイル名で保存。中断時も回収結果を保存し run 状態を明示。複数エンジンの round-robin 並列トーナメント。動的目標変更時の先後交換ペア維持、error ペアを同条件で再対局し、`--seed` による matchup ごとの決定的な開始局面選択、seed 付き meta、JSONL 出力、千日手の自動終局・エンジンへの対局履歴送信に対応（[詳細](tournament.md)）。SPRT の `--sprt-nelo0` / `--sprt-nelo1` は負値をスペース区切りで指定可能（例: `--sprt-nelo0 -10 --sprt-nelo1 0`、`nelo0 < nelo1` 必須）。USIの同一行exact主PVを `eval.last_exact_primary` に保存 |

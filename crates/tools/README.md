@@ -8,6 +8,8 @@ LayerStacks の [native / USI routing 対応と Q16 制限](docs/nnue-routing.md
 
 ### 対局・データ生成
 
+`tournament`の通常engine終了観測は[`meta.json`のengine_exits](docs/tournament.md#engine終了の観測)、任意の表示ファイルは[進捗テキスト出力](docs/tournament.md#任意の進捗テキスト出力)を参照。
+
 | ツール | 説明 |
 |--------|------|
 | `tournament` | 既存対局出力を保護し、カード index と表示ラベルを含むファイル名で保存。中断時も回収結果を保存し run 状態を明示。複数エンジンの round-robin 並列トーナメント、動的目標変更時の先後交換ペア維持、error ペア再対局、SPRT 検定。`--seed` による matchup ごとの決定的な開始局面選択と seed 付き meta 出力、千日手の自動終局・エンジンへの対局履歴送信に対応（[詳細](docs/tournament.md)）。SPRT の `--sprt-nelo0` / `--sprt-nelo1` は負値をスペース区切りで指定可能（例: `--sprt-nelo0 -10 --sprt-nelo1 0`、`nelo0 < nelo1` 必須）。USIの同一行exact主PVを `eval.last_exact_primary` に保存 |
