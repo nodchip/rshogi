@@ -1571,19 +1571,8 @@ fn main() -> Result<()> {
         // 送信前に target が下がった場合は `still_wanted` で再評価して破棄する。
         let offer: Option<Option<MatchTicket>> = if live_workers > desired_workers {
             Some(None)
-        } else if agg.stop_feeding && source.retry_queue.is_empty() {
-            None
         } else {
-            if agg.stop_feeding && pending.as_ref().is_some_and(|ticket| ticket.attempt == 0) {
-                pending = None;
-            }
-            if pending.as_ref().is_some_and(|t| !source.still_wanted(t)) {
-                pending = None; // target 減少で不要になった未送信チケットを破棄
-            }
-            if pending.is_none() {
-                pending = source.peek_ticket();
-            }
-            pending.clone().map(Some)
+            source.offer_ticket(&mut pending, agg.stop_feeding).map(Some)
         };
         let target_total = source.current_target_total();
 
@@ -1628,7 +1617,7 @@ fn main() -> Result<()> {
                         &mut desired_workers,
                         agg.completed,
                     );
-                    if source.has_next() && (!agg.stop_feeding || !source.retry_queue.is_empty())
+                    if source.offer_ticket(&mut pending, agg.stop_feeding).is_some()
                         || live_workers > desired_workers
                     {
                         continue;
@@ -1788,7 +1777,7 @@ fn handle_sprt_observation(
     let _ = state.observe(result);
     state.maybe_report(false);
     if !was_terminal && state.stopped_at.is_some() && !*stop_feeding {
-        // 境界到達: 新規チケット供給を止め、在庫（in-flight）だけ drain する。
+        // 境界到達: 新規ペアを止め、開始済みペアの完結・再試行と in-flight の回収を行う。
         *stop_feeding = true;
         let inflight = tickets_sent.saturating_sub(completed);
         println!("[SPRT] terminal decision reached; draining {inflight} in-flight game(s)...");
@@ -1996,6 +1985,26 @@ impl TicketSource {
         }
         let target = self.target_per_pair();
         self.emitted.iter().any(|&e| Self::pair_needs_more(e, target))
+    }
+
+    /// 送信候補を保持し、SPRT 停止後は開始済みペアの完結と再試行だけを供給する。
+    /// 新しい通常ペアは開始せず、送信成功まで発行数を進めない。
+    fn offer_ticket(
+        &self,
+        pending: &mut Option<MatchTicket>,
+        stop_feeding: bool,
+    ) -> Option<MatchTicket> {
+        let wanted = |ticket: &MatchTicket| {
+            self.still_wanted(ticket)
+                && (!stop_feeding || ticket.attempt > 0 || ticket.pair_slot == 1)
+        };
+        if pending.as_ref().is_some_and(|ticket| !wanted(ticket)) {
+            *pending = None;
+        }
+        if pending.is_none() && self.has_next() {
+            *pending = self.peek_ticket().filter(wanted);
+        }
+        pending.clone()
     }
 
     /// 次に発行すべきチケットを計算する（状態は進めない）。全ペアが目標到達なら `None`。
@@ -3162,6 +3171,109 @@ mod tests {
         assert!(!source.has_next());
         assert!(pull(&mut source).is_none());
         assert_pentanomial_integrity(&[slot0, slot1]);
+    }
+
+    #[test]
+    fn sprt_stop_closes_open_pair_without_starting_new_pairs() {
+        // 停止前、ペア途中、ペア境界、カード切替の各境界を検査する。
+        for sent_before_stop in 0usize..=7 {
+            let target = Arc::new(AtomicU32::new(2));
+            let mut source =
+                TicketSource::new(vec![(0, 1), (0, 2), (1, 2)], 1000, target.clone(), 42);
+            let mut tickets =
+                (0..sent_before_stop).map(|_| pull(&mut source).unwrap()).collect::<Vec<_>>();
+            let mut pending = source.peek_ticket();
+            let pending_id = pending.as_ref().unwrap().id;
+            // 停止後の target 増加でも、新規ペアは再開しない。
+            target.store(10, Ordering::Relaxed);
+            if !sent_before_stop.is_multiple_of(2) {
+                let closing = source.offer_ticket(&mut pending, true).unwrap();
+                let first = tickets.last().unwrap();
+                assert_eq!(closing.id, pending_id);
+                assert_eq!(closing.pair_slot, 1);
+                assert_eq!(closing.pair_index, first.pair_index);
+                assert_eq!(closing.startpos_idx, first.startpos_idx);
+                assert_eq!(
+                    (closing.black_idx, closing.white_idx),
+                    (first.white_idx, first.black_idx)
+                );
+                // recv が先に選ばれても、同じ未送信候補を保持する。
+                assert_eq!(source.offer_ticket(&mut pending, true).unwrap().id, closing.id);
+                source.commit_sent(&pending.take().unwrap());
+                tickets.push(closing);
+            }
+            assert!(source.offer_ticket(&mut pending, true).is_none());
+            assert!(pending.is_none());
+            assert_eq!(tickets.len(), sent_before_stop.div_ceil(2) * 2);
+            assert_pentanomial_integrity(&tickets);
+        }
+    }
+
+    #[test]
+    fn sprt_stop_preserves_retries_and_closes_pending_normal_pair() {
+        let target = Arc::new(AtomicU32::new(3));
+        let mut source = TicketSource::new(vec![(0, 1)], 1000, target.clone(), 42);
+        let first = pull(&mut source).unwrap();
+        let second = pull(&mut source).unwrap();
+        let open = pull(&mut source).unwrap();
+        let mut pending = source.peek_ticket();
+        source.observe_result(&result(first.clone(), super::GameOutcome::Draw, true));
+        source.observe_result(&result(second.clone(), super::GameOutcome::Draw, false));
+        target.store(0, Ordering::Relaxed);
+
+        let close = source.offer_ticket(&mut pending, true).unwrap();
+        assert_eq!(close.attempt, 0);
+        assert_eq!(close.pair_slot, 1);
+        assert_eq!(close.pair_index, open.pair_index);
+        source.commit_sent(&pending.take().unwrap());
+        assert_pentanomial_integrity(&[first.clone(), second.clone(), open, close]);
+        for original in [first, second] {
+            let retry = source.offer_ticket(&mut pending, true).unwrap();
+            assert_eq!(retry.attempt, 1);
+            assert_eq!(retry.pair_index, original.pair_index);
+            assert_eq!(retry.pair_slot, original.pair_slot);
+            assert_eq!(retry.startpos_idx, original.startpos_idx);
+            assert_eq!(
+                (retry.black_idx, retry.white_idx),
+                (original.black_idx, original.white_idx)
+            );
+            source.commit_sent(&pending.take().unwrap());
+        }
+        assert!(source.offer_ticket(&mut pending, true).is_none());
+        assert!(!source.has_next());
+    }
+
+    #[test]
+    fn sprt_stop_finds_closing_ticket_without_pending_offer() {
+        let target = Arc::new(AtomicU32::new(2));
+        let mut source = TicketSource::new(vec![(0, 1)], 1000, target, 42);
+        let first = pull(&mut source).unwrap();
+        let mut pending = None;
+        let second = source.offer_ticket(&mut pending, true).unwrap();
+        assert_eq!(second.pair_slot, 1);
+        assert_eq!(second.pair_index, first.pair_index);
+        source.commit_sent(&pending.take().unwrap());
+        assert_pentanomial_integrity(&[first, second]);
+        assert!(source.offer_ticket(&mut pending, true).is_none());
+    }
+
+    #[test]
+    fn offer_ticket_without_sprt_stop_respects_target_and_keeps_pair() {
+        let target = Arc::new(AtomicU32::new(2));
+        let mut source = TicketSource::new(vec![(0, 1)], 1000, target.clone(), 42);
+        let mut pending = source.peek_ticket();
+        target.store(0, Ordering::Relaxed);
+        assert!(source.offer_ticket(&mut pending, false).is_none());
+        target.store(2, Ordering::Relaxed);
+        let first = source.offer_ticket(&mut pending, false).unwrap();
+        assert_eq!(first.pair_slot, 0);
+        source.commit_sent(&pending.take().unwrap());
+        target.store(0, Ordering::Relaxed);
+        let second = source.offer_ticket(&mut pending, false).unwrap();
+        assert_eq!(second.pair_slot, 1);
+        source.commit_sent(&pending.take().unwrap());
+        assert_pentanomial_integrity(&[first, second]);
+        assert!(source.offer_ticket(&mut pending, false).is_none());
     }
 
     #[test]
