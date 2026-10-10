@@ -832,6 +832,14 @@ fn main() -> Result<()> {
         );
     }
 
+    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+    if use_onnx || use_dlshogi_onnx {
+        // Configure the process-global environment before any session/model load.
+        // Official Windows ORT builds otherwise enable model-metadata telemetry.
+        configure_onnx_telemetry(|enabled| ort::init().with_telemetry(enabled).commit())?;
+        eprintln!("ONNX telemetry explicitly configured off");
+    }
+
     // --search-depth 指定時に --apply-qsearch-leaf が有効なら警告
     if cli.search_depth.is_some() && cli.apply_qsearch_leaf {
         eprintln!("Warning: --apply-qsearch-leaf is ignored when --search-depth is specified");
@@ -2793,6 +2801,15 @@ fn seek_to_record<R: Seek>(reader: &mut R, record_count: u64) -> Result<u64> {
 enum OnnxValueOutput {
     Probability,
     Logit,
+}
+
+#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn configure_onnx_telemetry(commit: impl FnOnce(bool) -> bool) -> Result<()> {
+    anyhow::ensure!(
+        commit(false),
+        "ONNX environment was already configured; refusing to load a model without explicit telemetry protection"
+    );
+    Ok(())
 }
 
 impl OnnxValueOutput {
@@ -5229,6 +5246,28 @@ fn process_file_with_dlshogi_onnx(
 mod marker_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn onnx_telemetry_commits_explicit_disabled_setting() {
+        let mut observed = None;
+        configure_onnx_telemetry(|enabled| {
+            observed = Some(enabled);
+            true
+        })
+        .unwrap();
+        assert_eq!(observed, Some(false));
+    }
+
+    #[test]
+    fn onnx_telemetry_rejects_already_configured_environment() {
+        let mut observed = None;
+        let result = configure_onnx_telemetry(|enabled| {
+            observed = Some(enabled);
+            false
+        });
+        assert_eq!(observed, Some(false));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn onnx_output_cli_defaults_to_probability_and_accepts_explicit_logit() {

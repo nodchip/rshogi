@@ -61,6 +61,9 @@ target/release/rescore_psv \
   異なる方式では途中出力を再利用しない。既存成果物の保全には別の出力先を使用する。
   非有限値/shape検査とpadding保持を含むscore contractもmarkerに記録する。
   旧ONNX出力はこれらの検査を経ていないため、フルPSV・sidecarともそのまま再利用しない。
+- ONNX直接推論では、session/model読込み前にruntimeのtelemetryを明示的に無効化する。
+  既に環境設定が固定されていて無効指定を適用できない場合は、モデルを読み込まず失敗する。
+  これは他のネットワーク通信がないことを一般的に保証するものではない。
 - 長時間ジョブは `nohup` / `tmux` で流しっぱなしにする（非 TTY では自動で
   grep しやすいログ行形式になる）。
 
