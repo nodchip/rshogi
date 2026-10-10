@@ -50,6 +50,16 @@ target/release/rescore_psv \
   保存し（数十秒〜数分）、2 回目以降は再利用する。未指定だと毎回ビルドし直す。
   キャッシュは GPU アーキ固有で、GPU を変えたら自動で再ビルドされる。
 - `--onnx-eval-scale 600`: 勝率→cp 変換スケール。dlshogi 系の標準値。
+- `--onnx-value-output probability`（既定）: 確率を `[0.001, 0.999]` に制限し、
+  `log(p / (1-p)) * --onnx-eval-scale` で変換する。従来の変換と同じ。
+- `--onnx-value-output logit`: sigmoid を含まない value head に使用し、生の出力に
+  `--onnx-eval-scale` を掛ける。ファイル名から自動推定しない。モデルの仕様・符号・
+  出力スケールを別途検証して指定する。`[N]` または `[N,1]` の scalar 出力のみ許可し、
+  非有限値や乗算overflowは失敗とする。score以外のPSV bytes（paddingを含む）は保持する。
+  この指定は `rescore_psv` の直接ONNX経路のみが対象で、他のONNX利用ツールには適用しない。
+  変換方式は完了/途中markerで照合する。キーのない旧markerはprobabilityとして読み、
+  異なる方式では途中出力を再利用しない。既存成果物の保全には別の出力先を使用する。
+  フルPSVのpadding保持もmarkerに記録するため、旧フルPSV出力はそのまま再利用しない。
 - 長時間ジョブは `nohup` / `tmux` で流しっぱなしにする（非 TTY では自動で
   grep しやすいログ行形式になる）。
 
@@ -164,6 +174,7 @@ ort は load-dynamic のためビルド時に libonnxruntime は不要（実行�
 | `--onnx-tensorrt` | false | TensorRT EP（FP16）を使用 |
 | `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュ保存先（実質必須） |
 | `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（正の有限値） |
+| `--onnx-value-output` | probability | `probability`: logit変換後にscaleを掛ける。`logit`: 生の出力にscaleを掛ける |
 | `--onnx-draw-ply` | 0（調整なし） | AobaZero モデル用の引き分け手数 |
 | `--expand-output-dir` | — | policy 展開の出力先（レシピ参照） |
 | `--expand-threshold` | 10.0 | 展開する softmax 確率閾値 %（`(0, 100]`） |

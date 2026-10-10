@@ -45,7 +45,7 @@
 //! ```
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use glob::glob;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -291,6 +291,11 @@ struct Cli {
     #[arg(long, default_value_t = 600.0)]
     onnx_eval_scale: f32,
 
+    /// ONNX value encoding: probability applies logit; logit scales raw output directly.
+    /// Select explicitly from the model contract, never from its filename.
+    #[arg(long, value_enum, default_value_t = OnnxValueOutput::Probability)]
+    onnx_value_output: OnnxValueOutput,
+
     /// ORT profiling出力先ディレクトリ（指定するとsession.run()の内訳をJSONで出力）
     #[arg(long)]
     ort_profile: Option<PathBuf>,
@@ -461,6 +466,7 @@ fn onnx_marker_decide(
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
         eval_scale: cli.onnx_eval_scale,
+        value_output: cli.onnx_value_output,
         skip_in_check: cli.skip_in_check,
         onnx_draw_ply: onnx_draw_ply_for_fp,
         f1_size: 0,
@@ -805,6 +811,11 @@ fn main() -> Result<()> {
         if !s.is_finite() || s <= 0.0 {
             anyhow::bail!("--onnx-eval-scale must be a positive finite value, got {s}");
         }
+        if cli.score_clip < 0 {
+            anyhow::bail!("--score-clip must be nonnegative in ONNX mode");
+        }
+    } else if cli.onnx_value_output != OnnxValueOutput::Probability {
+        anyhow::bail!("--onnx-value-output logit requires ONNX mode");
     }
     #[cfg(not(feature = "aobazero-onnx"))]
     if use_onnx {
@@ -1495,6 +1506,8 @@ fn build_nnue_scores_fingerprint(
         skip_in_check: false,
         score_clip: cli.score_clip,
         eval_scale_bits: 0,
+        value_output: OnnxValueOutput::Probability,
+        preserve_psv_padding: None,
         use_tensorrt: None,
         onnx_draw_ply: 0,
         qsearch_leaf_label: false,
@@ -2776,6 +2789,78 @@ fn seek_to_record<R: Seek>(reader: &mut R, record_count: u64) -> Result<u64> {
     Ok(offset)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OnnxValueOutput {
+    Probability,
+    Logit,
+}
+
+impl OnnxValueOutput {
+    fn marker_name(self) -> &'static str {
+        match self {
+            Self::Probability => "probability",
+            Self::Logit => "logit",
+        }
+    }
+
+    fn parse_marker(value: &str) -> Result<Self> {
+        match value {
+            "probability" => Ok(Self::Probability),
+            "logit" => Ok(Self::Logit),
+            _ => anyhow::bail!("invalid onnx_value_output"),
+        }
+    }
+
+    #[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+    fn leaf_score(self, value: f32, scale: f32) -> Result<f32> {
+        anyhow::ensure!(value.is_finite(), "non-finite ONNX value output");
+        anyhow::ensure!(scale.is_finite() && scale > 0.0, "invalid ONNX eval scale");
+        let logit = match self {
+            Self::Probability => {
+                // Preserve the existing probability conversion, including endpoint clipping.
+                let clamped = value.clamp(0.001, 0.999);
+                (clamped / (1.0 - clamped)).ln()
+            }
+            Self::Logit => value,
+        };
+        let score = logit * scale;
+        anyhow::ensure!(score.is_finite(), "ONNX score multiplication overflow");
+        Ok(score)
+    }
+}
+
+#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn clip_onnx_score(leaf_score: f32, flip_stm: bool, clip: i16) -> Result<(i16, bool)> {
+    anyhow::ensure!(leaf_score.is_finite() && clip >= 0, "invalid ONNX score or clip");
+    let signed = if flip_stm { -leaf_score } else { leaf_score };
+    // Rust's finite float -> i32 cast saturates; unsigned_abs also handles i32::MIN.
+    let raw = signed as i32;
+    let clipped = raw.unsigned_abs() > clip as u32;
+    Ok((raw.clamp(-(clip as i32), clip as i32) as i16, clipped))
+}
+
+#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn validate_onnx_value_shape(shape: &[i64], len: usize, batch: usize) -> Result<()> {
+    let n = i64::try_from(batch).context("ONNX batch size overflow")?;
+    anyhow::ensure!(
+        batch > 0 && len == batch && (shape == [n] || shape == [n, 1]),
+        "ONNX output_value must contain one scalar per batch item ([N] or [N,1])"
+    );
+    Ok(())
+}
+
+#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn with_onnx_score(psv: &PackedSfenValue, score: i16) -> PackedSfenValue {
+    PackedSfenValue {
+        sfen: psv.sfen,
+        score,
+        move16: psv.move16,
+        game_ply: psv.game_ply,
+        game_result: psv.game_result,
+        padding: psv.padding,
+    }
+}
+
 /// ONNX 直接推論パイプラインの共通設定
 ///
 /// 全フィールドが `Copy` のため、関数内で destructure して既存ローカル変数名と
@@ -2800,6 +2885,7 @@ struct OnnxPipelineConfig<'a> {
     tensorrt_cache: Option<&'a std::path::Path>,
     score_clip: i16,
     eval_scale: f32,
+    value_output: OnnxValueOutput,
     skip_in_check: bool,
     onnx_draw_ply: i32,
     f1_size: usize,
@@ -2863,6 +2949,10 @@ struct RunFingerprint {
     skip_in_check: bool,
     score_clip: i16,
     eval_scale_bits: u32,
+    value_output: OnnxValueOutput,
+    // Full ONNX PSV now retains padding; legacy markers must not mix old/new bytes.
+    // Sidecar and NNUE modes are unaffected and leave this field absent.
+    preserve_psv_padding: Option<bool>,
     // 旧 marker のキー欠落は unknown (`None`)。現行実行は常に `Some` を設定するため、
     // CUDA / TensorRT のどちらとも一致せず一度だけ再生成される。
     use_tensorrt: Option<bool>,
@@ -2961,6 +3051,10 @@ fn serialize_marker(marker: &DoneMarker) -> String {
     let _ = writeln!(out, "skip_in_check={}", f.skip_in_check);
     let _ = writeln!(out, "score_clip={}", f.score_clip);
     let _ = writeln!(out, "eval_scale_bits=0x{:08x}", f.eval_scale_bits);
+    let _ = writeln!(out, "onnx_value_output={}", f.value_output.marker_name());
+    if let Some(preserve) = f.preserve_psv_padding {
+        let _ = writeln!(out, "onnx_preserve_psv_padding={preserve}");
+    }
     if let Some(use_tensorrt) = f.use_tensorrt {
         let _ = writeln!(out, "use_tensorrt={use_tensorrt}");
     }
@@ -3145,6 +3239,16 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         skip_in_check: parse_bool(get("skip_in_check")?)?,
         score_clip: get("score_clip")?.parse().context("invalid score_clip")?,
         eval_scale_bits: parse_hex_u32(get("eval_scale_bits")?)?,
+        // Every pre-encoding marker used probability -> logit conversion.
+        value_output: map
+            .get("onnx_value_output")
+            .map(|v| OnnxValueOutput::parse_marker(v))
+            .transpose()?
+            .unwrap_or(OnnxValueOutput::Probability),
+        preserve_psv_padding: map
+            .get("onnx_preserve_psv_padding")
+            .map(|v| parse_bool(v))
+            .transpose()?,
         // 旧 marker は実行 backend を追跡していなかった。欠落は unknown として保持し、
         // 現行の CUDA / TensorRT のどちらとも fingerprint が一致しないようにする。
         use_tensorrt: map.get("use_tensorrt").map(|v| parse_bool(v)).transpose()?,
@@ -3559,6 +3663,8 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         skip_in_check: config.skip_in_check,
         score_clip: config.score_clip,
         eval_scale_bits: config.eval_scale.to_bits(),
+        value_output: config.value_output,
+        preserve_psv_padding: (!config.out_scores).then_some(true),
         use_tensorrt: Some(config.use_tensorrt),
         onnx_draw_ply: config.onnx_draw_ply,
         qsearch_leaf_label: config.qsearch_leaf_label,
@@ -3725,6 +3831,7 @@ where
         tensorrt_cache,
         score_clip,
         eval_scale,
+        value_output,
         skip_in_check,
         onnx_draw_ply: _,
         f1_size,
@@ -4279,8 +4386,9 @@ where
 
                 let outputs = session.run_binding(&binding).map_err(onnx_ort_err)?;
 
-                let (_, values) =
+                let (value_shape, values) =
                     outputs["output_value"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
+                validate_onnx_value_shape(value_shape, values.len(), actual_batch)?;
                 if phase_timing {
                     t_run += phase_t.elapsed().as_nanos();
                     phase_t = Instant::now();
@@ -4302,34 +4410,18 @@ where
                         skipped += 1;
                         continue;
                     }
-                    let winrate = values[i];
-                    let clamped = winrate.clamp(0.001, 0.999);
-                    let logit = (clamped / (1.0 - clamped)).ln();
                     // qsearch-leaf-label モードで葉の STM が root と異なる場合、推論値は
                     // 葉の手番視点なので root 視点へ符号反転する。
-                    let leaf_score = logit * eval_scale;
-                    let signed_score = if batch.stm_flags[i] {
-                        -leaf_score
-                    } else {
-                        leaf_score
-                    };
-                    let raw_score = signed_score as i32;
-                    let clipped = raw_score.abs() > score_clip as i32;
-                    let new_score = raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16;
+                    let leaf_score = value_output.leaf_score(values[i], eval_scale)?;
+                    let (new_score, clipped) =
+                        clip_onnx_score(leaf_score, batch.stm_flags[i], score_clip)?;
                     if clipped {
                         clipped_n += 1;
                     }
                     // leaf-LABEL arm: 出力 sfen は常に root の `psv.sfen`（局面は置換
-                    // しない）。葉評価はラベルのみに反映（符号反転は signed_score に
+                    // しない）。葉評価はラベルのみに反映（符号反転は new_score に
                     // 適用済み）。
-                    let new_psv = PackedSfenValue {
-                        sfen: psv.sfen,
-                        score: new_score,
-                        move16: psv.move16,
-                        game_ply: psv.game_ply,
-                        game_result: psv.game_result,
-                        padding: 0,
-                    };
+                    let new_psv = with_onnx_score(psv, new_score);
                     append_rescore_bytes(&mut rescore_bytes, &new_psv, out_scores);
 
                     // leaf-REPLACEMENT arm（有効時のみ、leaf-LABEL と 1:1 lockstep）。
@@ -4338,9 +4430,8 @@ where
                     // - score は葉評価（符号反転なし＝葉手番視点）に clip 適用
                     // - game_result は STM 反転時のみ符号反転
                     if want_replacement {
-                        let leaf_raw = leaf_score as i32;
-                        let leaf_clipped_score =
-                            leaf_raw.clamp(-(score_clip as i32), score_clip as i32) as i16;
+                        let (leaf_clipped_score, _) =
+                            clip_onnx_score(leaf_score, false, score_clip)?;
                         let leaf_game_result = if batch.stm_flags[i] {
                             -psv.game_result
                         } else {
@@ -5039,6 +5130,7 @@ fn process_file_with_onnx(
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
         eval_scale: cli.onnx_eval_scale,
+        value_output: cli.onnx_value_output,
         skip_in_check: cli.skip_in_check,
         onnx_draw_ply: cli.onnx_draw_ply,
         f1_size: FEATURES1_SIZE,
@@ -5104,6 +5196,7 @@ fn process_file_with_dlshogi_onnx(
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
         eval_scale: cli.onnx_eval_scale,
+        value_output: cli.onnx_value_output,
         skip_in_check: cli.skip_in_check,
         // dlshogi モデルでは `onnx_draw_ply` を使わない。fingerprint の過剰
         // invalidation を避けるため 0 固定（`onnx_marker_decide` 側でも同じ扱い）。
@@ -5135,6 +5228,149 @@ fn process_file_with_dlshogi_onnx(
 mod marker_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn onnx_output_cli_defaults_to_probability_and_accepts_explicit_logit() {
+        let args = ["rescore_psv", "--input", "in.psv", "--output-dir", "out"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.onnx_value_output, OnnxValueOutput::Probability);
+        let cli =
+            Cli::try_parse_from(args.into_iter().chain(["--onnx-value-output", "logit"])).unwrap();
+        assert_eq!(cli.onnx_value_output, OnnxValueOutput::Logit);
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--onnx-value-output", "auto"])).is_err()
+        );
+    }
+
+    #[test]
+    fn onnx_probability_preserves_legacy_conversion_and_endpoint_clamp() {
+        for value in [-0.5_f32, 0.0, 0.001, 0.25, 0.5, 0.75, 0.999, 1.0, 1.5] {
+            let clamped = value.clamp(0.001, 0.999);
+            let legacy = (clamped / (1.0 - clamped)).ln() * 600.0;
+            assert_eq!(OnnxValueOutput::Probability.leaf_score(value, 600.0).unwrap(), legacy);
+        }
+        assert_eq!(OnnxValueOutput::Probability.leaf_score(0.5, 600.0).unwrap(), 0.0);
+        assert!(
+            (OnnxValueOutput::Probability.leaf_score(0.75, 600.0).unwrap() - 659.1674).abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn onnx_logit_scales_negative_zero_positive_without_probability_clamp() {
+        for (value, expected) in [(-2.0, -1200.0), (0.0, 0.0), (2.0, 1200.0)] {
+            assert_eq!(OnnxValueOutput::Logit.leaf_score(value, 600.0).unwrap(), expected);
+        }
+        assert_eq!(OnnxValueOutput::Logit.leaf_score(1.25, 24.0).unwrap(), 30.0);
+    }
+
+    #[test]
+    fn onnx_conversion_rejects_nonfinite_invalid_scale_and_overflow() {
+        for mode in [OnnxValueOutput::Probability, OnnxValueOutput::Logit] {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert!(mode.leaf_score(value, 600.0).is_err());
+            }
+            for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert!(mode.leaf_score(0.75, scale).is_err());
+            }
+        }
+        assert!(OnnxValueOutput::Logit.leaf_score(f32::MAX, 2.0).is_err());
+        assert!(OnnxValueOutput::Probability.leaf_score(1.0, f32::MAX).is_err());
+    }
+
+    #[test]
+    fn onnx_score_clip_preserves_sign_truncation_and_exact_boundary() {
+        for (score, expected, clipped) in [
+            (99.9, 99, false),
+            (100.0, 100, false),
+            (101.0, 100, true),
+            (-99.9, -99, false),
+            (-100.0, -100, false),
+            (-101.0, -100, true),
+            (f32::MAX, 100, true),
+            (-f32::MAX, -100, true),
+        ] {
+            assert_eq!(clip_onnx_score(score, false, 100).unwrap(), (expected, clipped));
+            assert_eq!(clip_onnx_score(score, true, 100).unwrap(), (-expected, clipped));
+        }
+        assert_eq!(clip_onnx_score(0.0, true, 0).unwrap(), (0, false));
+        assert_eq!(clip_onnx_score(1.0, false, 0).unwrap(), (0, true));
+        assert!(clip_onnx_score(f32::NAN, false, 100).is_err());
+        assert!(clip_onnx_score(f32::INFINITY, false, 100).is_err());
+        assert!(clip_onnx_score(0.0, false, -1).is_err());
+    }
+
+    #[test]
+    fn onnx_value_tensor_requires_one_scalar_per_item() {
+        assert!(validate_onnx_value_shape(&[3], 3, 3).is_ok());
+        assert!(validate_onnx_value_shape(&[3, 1], 3, 3).is_ok());
+        for (shape, len, batch) in [
+            (vec![1, 3], 3, 3),
+            (vec![3, 1, 1], 3, 3),
+            (vec![3, 2], 6, 3),
+            (vec![3], 2, 3),
+            (vec![2], 3, 3),
+            (vec![], 1, 1),
+            (vec![0], 0, 0),
+        ] {
+            assert!(validate_onnx_value_shape(&shape, len, batch).is_err());
+        }
+    }
+
+    #[test]
+    fn onnx_rescore_preserves_all_non_score_psv_bytes() {
+        let mut input = test_psv(-123);
+        input.padding = 117;
+        let output = with_onnx_score(&input, 456);
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        append_rescore_bytes(&mut before, &input, false);
+        append_rescore_bytes(&mut after, &output, false);
+        assert_eq!(before.len(), 40);
+        assert_eq!(&after[..32], &before[..32]);
+        assert_eq!(&after[32..34], &456_i16.to_le_bytes());
+        assert_eq!(&after[34..], &before[34..]);
+    }
+
+    #[test]
+    fn onnx_output_marker_legacy_probability_and_logit_roundtrip() {
+        let legacy = parse_text(&base_marker("use_tensorrt=false\n"));
+        let probability =
+            parse_text(&base_marker("use_tensorrt=false\nonnx_value_output=probability\n"));
+        let logit = parse_text(&base_marker("use_tensorrt=false\nonnx_value_output=logit\n"));
+        assert_eq!(legacy.fingerprint, probability.fingerprint);
+        assert_ne!(legacy.fingerprint, logit.fingerprint);
+        assert_eq!(logit, parse_text(&serialize_marker(&logit)));
+        assert!(OnnxValueOutput::parse_marker("automatic").is_err());
+    }
+
+    #[test]
+    fn onnx_padding_preservation_invalidates_legacy_full_psv_marker() {
+        let legacy = parse_text(&base_marker(""));
+        let current = parse_text(&base_marker("onnx_preserve_psv_padding=true\n"));
+        assert_eq!(legacy.fingerprint.preserve_psv_padding, None);
+        assert_eq!(current.fingerprint.preserve_psv_padding, Some(true));
+        assert_ne!(legacy.fingerprint, current.fingerprint);
+        assert_eq!(current, parse_text(&serialize_marker(&current)));
+    }
+
+    #[test]
+    fn onnx_output_changed_encoding_rejects_finalize_and_does_not_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("scores.i16");
+        let probability = test_fingerprint(true);
+        write_in_progress_marker(&output, &probability).unwrap();
+        std::fs::write(&output, [1, 2]).unwrap();
+        let mut logit = probability.clone();
+        logit.value_output = OnnxValueOutput::Logit;
+        assert!(ensure_sidecar_fingerprint_unchanged(&probability, &logit, "finalize").is_err());
+        assert_eq!(
+            prepare_in_progress_marker(&output, &logit, false).unwrap(),
+            Some(SidecarStartDecision::Truncate)
+        );
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+        assert_eq!(parse_marker(&in_progress_marker_path_for(&output)).unwrap().fingerprint, logit);
+    }
 
     /// 必須キーを満たす最小 marker テキスト（expand=false）。`extra` に qsearch 系の追加行を差し込む。
     fn base_marker(extra: &str) -> String {
