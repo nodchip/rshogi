@@ -59,7 +59,8 @@ target/release/rescore_psv \
   この指定は `rescore_psv` の直接ONNX経路のみが対象で、他のONNX利用ツールには適用しない。
   変換方式は完了/途中markerで照合する。キーのない旧markerはprobabilityとして読み、
   異なる方式では途中出力を再利用しない。既存成果物の保全には別の出力先を使用する。
-  フルPSVのpadding保持もmarkerに記録するため、旧フルPSV出力はそのまま再利用しない。
+  非有限値/shape検査とpadding保持を含むscore contractもmarkerに記録する。
+  旧ONNX出力はこれらの検査を経ていないため、フルPSV・sidecarともそのまま再利用しない。
 - 長時間ジョブは `nohup` / `tmux` で流しっぱなしにする（非 TTY では自動で
   grep しやすいログ行形式になる）。
 

@@ -1507,7 +1507,7 @@ fn build_nnue_scores_fingerprint(
         score_clip: cli.score_clip,
         eval_scale_bits: 0,
         value_output: OnnxValueOutput::Probability,
-        preserve_psv_padding: None,
+        onnx_score_contract: None,
         use_tensorrt: None,
         onnx_draw_ply: 0,
         qsearch_leaf_label: false,
@@ -2950,9 +2950,10 @@ struct RunFingerprint {
     score_clip: i16,
     eval_scale_bits: u32,
     value_output: OnnxValueOutput,
-    // Full ONNX PSV now retains padding; legacy markers must not mix old/new bytes.
-    // Sidecar and NNUE modes are unaffected and leave this field absent.
-    preserve_psv_padding: Option<bool>,
+    // Contract 1 checks finite scalar output/shape and preserves non-score PSV bytes.
+    // Legacy ONNX prefixes did not perform these checks and must not be reused.
+    // NNUE mode is unaffected and leaves this field absent.
+    onnx_score_contract: Option<u32>,
     // 旧 marker のキー欠落は unknown (`None`)。現行実行は常に `Some` を設定するため、
     // CUDA / TensorRT のどちらとも一致せず一度だけ再生成される。
     use_tensorrt: Option<bool>,
@@ -3052,8 +3053,8 @@ fn serialize_marker(marker: &DoneMarker) -> String {
     let _ = writeln!(out, "score_clip={}", f.score_clip);
     let _ = writeln!(out, "eval_scale_bits=0x{:08x}", f.eval_scale_bits);
     let _ = writeln!(out, "onnx_value_output={}", f.value_output.marker_name());
-    if let Some(preserve) = f.preserve_psv_padding {
-        let _ = writeln!(out, "onnx_preserve_psv_padding={preserve}");
+    if let Some(contract) = f.onnx_score_contract {
+        let _ = writeln!(out, "onnx_score_contract={contract}");
     }
     if let Some(use_tensorrt) = f.use_tensorrt {
         let _ = writeln!(out, "use_tensorrt={use_tensorrt}");
@@ -3245,9 +3246,9 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
             .map(|v| OnnxValueOutput::parse_marker(v))
             .transpose()?
             .unwrap_or(OnnxValueOutput::Probability),
-        preserve_psv_padding: map
-            .get("onnx_preserve_psv_padding")
-            .map(|v| parse_bool(v))
+        onnx_score_contract: map
+            .get("onnx_score_contract")
+            .map(|v| v.parse().context("invalid onnx_score_contract"))
             .transpose()?,
         // 旧 marker は実行 backend を追跡していなかった。欠落は unknown として保持し、
         // 現行の CUDA / TensorRT のどちらとも fingerprint が一致しないようにする。
@@ -3664,7 +3665,7 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         score_clip: config.score_clip,
         eval_scale_bits: config.eval_scale.to_bits(),
         value_output: config.value_output,
-        preserve_psv_padding: (!config.out_scores).then_some(true),
+        onnx_score_contract: Some(1),
         use_tensorrt: Some(config.use_tensorrt),
         onnx_draw_ply: config.onnx_draw_ply,
         qsearch_leaf_label: config.qsearch_leaf_label,
@@ -5345,13 +5346,23 @@ mod marker_tests {
     }
 
     #[test]
-    fn onnx_padding_preservation_invalidates_legacy_full_psv_marker() {
-        let legacy = parse_text(&base_marker(""));
-        let current = parse_text(&base_marker("onnx_preserve_psv_padding=true\n"));
-        assert_eq!(legacy.fingerprint.preserve_psv_padding, None);
-        assert_eq!(current.fingerprint.preserve_psv_padding, Some(true));
-        assert_ne!(legacy.fingerprint, current.fingerprint);
-        assert_eq!(current, parse_text(&serialize_marker(&current)));
+    fn onnx_output_contract_invalidates_legacy_full_psv_and_sidecar_markers() {
+        for extra in ["", "out_scores=true\n"] {
+            let legacy = parse_text(&base_marker(extra));
+            let current = parse_text(&base_marker(&format!("{extra}onnx_score_contract=1\n")));
+            assert_eq!(legacy.fingerprint.onnx_score_contract, None);
+            assert_eq!(current.fingerprint.onnx_score_contract, Some(1));
+            assert_ne!(legacy.fingerprint, current.fingerprint);
+            assert_eq!(current, parse_text(&serialize_marker(&current)));
+            assert!(
+                ensure_sidecar_fingerprint_unchanged(
+                    &legacy.fingerprint,
+                    &current.fingerprint,
+                    "before processing"
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
